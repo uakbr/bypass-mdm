@@ -119,6 +119,13 @@ if [ "$(id -u)" -ne 0 ]; then
 	exit 1
 fi
 
+# ── SIP detection ──
+
+SIP_ENABLED=true
+if csrutil status 2>/dev/null | grep -q "disabled"; then
+	SIP_ENABLED=false
+fi
+
 # ── ERR trap: re-lock schg flags if script fails mid-run ──
 
 _emergency_relock() {
@@ -127,7 +134,9 @@ _emergency_relock() {
 		echo ""
 		fail "Script failed (exit $exit_code) — attempting to re-lock modified files..."
 		chflags schg /etc/hosts 2>/dev/null || true
-		chflags -R schg /var/db/ConfigurationProfiles/Settings 2>/dev/null || true
+		if ! $SIP_ENABLED; then
+			chflags -R schg /var/db/ConfigurationProfiles/Settings 2>/dev/null || true
+		fi
 		warn "Files re-locked. Check $LOG_FILE for details."
 		warn "Your backups are in $BACKUP_DIR"
 	fi
@@ -284,7 +293,11 @@ if $UNINSTALL; then
 	# Remove schg flags
 	echo -e "${PUR}[3/5]${NC} ${CYAN}Removing immutable flags${NC}"
 	chflags noschg /etc/hosts 2>/dev/null || true
-	chflags -R noschg /var/db/ConfigurationProfiles/Settings 2>/dev/null || true
+	if $SIP_ENABLED; then
+		info "SIP enabled — skipping config dir flag removal (SIP protected)"
+	else
+		chflags -R noschg /var/db/ConfigurationProfiles/Settings 2>/dev/null || true
+	fi
 	for ident in "${MDM_DAEMONS[@]}"; do
 		chflags noschg "/Library/LaunchDaemons/${ident}.plist" 2>/dev/null || true
 	done
@@ -346,9 +359,13 @@ if ! $DRY_RUN; then
 
 	config_settings="/var/db/ConfigurationProfiles/Settings"
 	if [ -d "$config_settings" ] && [ ! -d "$BACKUP_DIR/Settings.orig" ]; then
-		chflags -R noschg "$config_settings" 2>/dev/null || true
+		if ! $SIP_ENABLED; then
+			chflags -R noschg "$config_settings" 2>/dev/null || true
+		fi
 		cp -Rp "$config_settings" "$BACKUP_DIR/Settings.orig" 2>/dev/null || true
-		chflags -R schg "$config_settings" 2>/dev/null || true
+		if ! $SIP_ENABLED; then
+			chflags -R schg "$config_settings" 2>/dev/null || true
+		fi
 	fi
 
 	disabled_plist_src="/private/var/db/com.apple.xpc.launchd/disabled.plist"
@@ -412,20 +429,47 @@ echo -e "${PUR}[3/8]${NC} ${CYAN}Setting bypass configuration markers${NC}"
 
 config_dir="/var/db/ConfigurationProfiles/Settings"
 
-# Remove immutable if set from a previous run
-if [ -d "$config_dir" ] && ls -lOd "$config_dir" 2>/dev/null | grep -q "schg"; then
-	run "Remove schg from config dir" chflags -R noschg "$config_dir"
+if $SIP_ENABLED; then
+	warn "SIP is enabled — /var/db/ConfigurationProfiles is protected"
+	info "Config markers will be set on a best-effort basis"
+	info "To fully modify config markers, disable SIP from Recovery Mode"
 fi
 
-run "Create config dir" mkdir -p "$config_dir"
-run "Remove activation record" rm -f "$config_dir/.cloudConfigHasActivationRecord"
-run "Remove config record found" rm -f "$config_dir/.cloudConfigRecordFound"
-run "Create profile installed marker" touch "$config_dir/.cloudConfigProfileInstalled"
-run "Create record not found marker" touch "$config_dir/.cloudConfigRecordNotFound"
+# Remove immutable if set from a previous run (only works with SIP off)
+if [ -d "$config_dir" ] && ls -lOd "$config_dir" 2>/dev/null | grep -q "schg"; then
+	run "Remove schg from config dir" chflags -R noschg "$config_dir" || true
+fi
 
-# Lock the config directory
-run "Set config dir immutable" chflags -R schg "$config_dir"
-run_ok "Configuration markers set and locked"
+# All config marker operations are best-effort (SIP may block them)
+if ! $DRY_RUN; then
+	mkdir -p "$config_dir" 2>/dev/null || true
+	rm -f "$config_dir/.cloudConfigHasActivationRecord" 2>/dev/null || true
+	rm -f "$config_dir/.cloudConfigRecordFound" 2>/dev/null || true
+	touch "$config_dir/.cloudConfigProfileInstalled" 2>/dev/null || true
+	touch "$config_dir/.cloudConfigRecordNotFound" 2>/dev/null || true
+
+	# Verify what actually succeeded
+	local_ok=true
+	if [ -f "$config_dir/.cloudConfigHasActivationRecord" ] || [ -f "$config_dir/.cloudConfigRecordFound" ]; then
+		warn "Could not remove activation records (SIP protected)"
+		local_ok=false
+	fi
+	if [ ! -f "$config_dir/.cloudConfigProfileInstalled" ] || [ ! -f "$config_dir/.cloudConfigRecordNotFound" ]; then
+		warn "Could not create bypass markers (SIP protected)"
+		local_ok=false
+	fi
+
+	if $local_ok; then
+		# Lock the config directory (only if we could modify it)
+		chflags -R schg "$config_dir" 2>/dev/null || true
+		success "Configuration markers set and locked"
+	else
+		warn "Config markers skipped — SIP prevents modification on live OS"
+		info "This is OK if markers were set during Recovery Mode bypass"
+	fi
+else
+	info "[DRY-RUN] Would set bypass config markers in $config_dir"
+fi
 echo ""
 
 # ── Step 4: Disable MDM daemons/agents in launchd ──
@@ -583,17 +627,20 @@ done
 # Re-lock hosts file
 chflags schg /etc/hosts 2>/dev/null
 
-# ── Re-enforce config markers ──
+# ── Re-enforce config markers (best-effort — SIP may block) ──
 CONFIG_DIR="/var/db/ConfigurationProfiles/Settings"
 chflags -R noschg "$CONFIG_DIR" 2>/dev/null
 mkdir -p "$CONFIG_DIR" 2>/dev/null
 
-touch "$CONFIG_DIR/.cloudConfigProfileInstalled" 2>/dev/null
-touch "$CONFIG_DIR/.cloudConfigRecordNotFound" 2>/dev/null
-rm -f "$CONFIG_DIR/.cloudConfigHasActivationRecord" 2>/dev/null
-rm -f "$CONFIG_DIR/.cloudConfigRecordFound" 2>/dev/null
+touch "$CONFIG_DIR/.cloudConfigProfileInstalled" 2>/dev/null || true
+touch "$CONFIG_DIR/.cloudConfigRecordNotFound" 2>/dev/null || true
+rm -f "$CONFIG_DIR/.cloudConfigHasActivationRecord" 2>/dev/null || true
+rm -f "$CONFIG_DIR/.cloudConfigRecordFound" 2>/dev/null || true
 
-chflags -R schg "$CONFIG_DIR" 2>/dev/null
+# Only lock if we can (SIP off)
+if chflags -R schg "$CONFIG_DIR" 2>/dev/null; then
+	echo "[$(date "+%H:%M:%S")] Config dir locked"
+fi
 
 # ── Re-disable MDM daemons ──
 MDM_DAEMONS=(
