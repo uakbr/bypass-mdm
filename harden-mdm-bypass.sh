@@ -309,12 +309,12 @@ if $UNINSTALL; then
 	# Remove override plists
 	echo -e "${PUR}[4/5]${NC} ${CYAN}Removing override plists${NC}"
 	for ident in "${MDM_DAEMONS[@]}"; do
-		rm -f "/Library/LaunchDaemons/${ident}.plist"
+		rm -f "/Library/LaunchDaemons/${ident}.plist" 2>/dev/null || true
 	done
 	for ident in "${MDM_AGENTS[@]}"; do
-		rm -f "/Library/LaunchAgents/${ident}.plist"
+		rm -f "/Library/LaunchAgents/${ident}.plist" 2>/dev/null || true
 	done
-	success "Override plists removed"
+	success "Override plists removed (or were SIP-protected)"
 
 	# Remove MDM domain blocks from hosts
 	echo -e "${PUR}[5/5]${NC} ${CYAN}Removing MDM blocks from /etc/hosts${NC}"
@@ -553,20 +553,42 @@ create_override_plist() {
 		return
 	fi
 
-	mkdir -p "$dir" 2>/dev/null
-	echo "$content" > "$plist_path"
-	chmod 644 "$plist_path"
-	chflags schg "$plist_path" 2>/dev/null || true
+	mkdir -p "$dir" 2>/dev/null || true
+	# SIP may block writes to com.apple.* plists in /Library/Launch*
+	if echo "$content" > "$plist_path" 2>/dev/null; then
+		chmod 644 "$plist_path" 2>/dev/null || true
+		chflags schg "$plist_path" 2>/dev/null || true
+		return 0
+	else
+		return 1
+	fi
 }
 
+override_ok=0
+override_fail=0
 for ident in "${MDM_DAEMONS[@]}"; do
-	create_override_plist "/Library/LaunchDaemons" "$ident"
+	if create_override_plist "/Library/LaunchDaemons" "$ident"; then
+		override_ok=$((override_ok + 1))
+	else
+		override_fail=$((override_fail + 1))
+	fi
 done
 for ident in "${MDM_AGENTS[@]}"; do
-	create_override_plist "/Library/LaunchAgents" "$ident"
+	if create_override_plist "/Library/LaunchAgents" "$ident"; then
+		override_ok=$((override_ok + 1))
+	else
+		override_fail=$((override_fail + 1))
+	fi
 done
 
-run_ok "Override plists created and locked for all MDM services"
+if [ $override_fail -eq 0 ]; then
+	run_ok "Override plists created and locked for all MDM services"
+elif [ $override_ok -gt 0 ]; then
+	warn "Created $override_ok override plists, $override_fail blocked by SIP"
+else
+	warn "SIP blocked all override plists — services disabled via launchctl instead"
+	info "The launchctl disable + disabled.plist (step 4) is the primary mechanism"
+fi
 echo ""
 
 # ── Step 6: Install guardian daemon (re-enforce every 5 min) ──
