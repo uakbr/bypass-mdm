@@ -278,24 +278,30 @@ if $UNINSTALL; then
 	touch "$LOG_FILE" 2>/dev/null || true
 	log "=== Uninstall started ==="
 
-	# Stop and remove guardian
-	echo -e "${PUR}[1/5]${NC} ${CYAN}Removing guardian daemon${NC}"
-	launchctl bootout "system/${GUARDIAN_LABEL}" 2>/dev/null || true
-	rm -f "$GUARDIAN_PLIST" "$GUARDIAN_SCRIPT"
-	success "Guardian removed"
-
-	# Stop and remove watcher
-	echo -e "${PUR}[2/5]${NC} ${CYAN}Removing watcher daemon${NC}"
-	launchctl bootout "system/${WATCHER_LABEL}" 2>/dev/null || true
-	rm -f "$WATCHER_PLIST" "$WATCHER_SCRIPT"
-	success "Watcher removed"
-
-	# Remove schg flags
-	echo -e "${PUR}[3/5]${NC} ${CYAN}Removing immutable flags${NC}"
-	chflags noschg /etc/hosts 2>/dev/null || true
-	if $SIP_ENABLED; then
-		info "SIP enabled — skipping config dir flag removal (SIP protected)"
+	# ── 1/8: Stop and remove guardian ──
+	echo -e "${PUR}[1/8]${NC} ${CYAN}Removing guardian daemon${NC}"
+	if launchctl bootout "system/${GUARDIAN_LABEL}" 2>/dev/null; then
+		success "Guardian daemon unloaded"
 	else
+		info "Guardian daemon was not loaded"
+	fi
+	rm -f "$GUARDIAN_PLIST" "$GUARDIAN_SCRIPT"
+	success "Guardian files removed"
+
+	# ── 2/8: Stop and remove watcher ──
+	echo -e "${PUR}[2/8]${NC} ${CYAN}Removing watcher daemon${NC}"
+	if launchctl bootout "system/${WATCHER_LABEL}" 2>/dev/null; then
+		success "Watcher daemon unloaded"
+	else
+		info "Watcher daemon was not loaded"
+	fi
+	rm -f "$WATCHER_PLIST" "$WATCHER_SCRIPT"
+	success "Watcher files removed"
+
+	# ── 3/8: Remove all immutable (schg) flags ──
+	echo -e "${PUR}[3/8]${NC} ${CYAN}Removing immutable flags${NC}"
+	chflags noschg /etc/hosts 2>/dev/null || true
+	if ! $SIP_ENABLED; then
 		chflags -R noschg /var/db/ConfigurationProfiles/Settings 2>/dev/null || true
 	fi
 	for ident in "${MDM_DAEMONS[@]}"; do
@@ -306,30 +312,128 @@ if $UNINSTALL; then
 	done
 	success "Immutable flags removed"
 
-	# Remove override plists
-	echo -e "${PUR}[4/5]${NC} ${CYAN}Removing override plists${NC}"
+	# ── 4/8: Remove override plists ──
+	echo -e "${PUR}[4/8]${NC} ${CYAN}Removing override plists${NC}"
 	for ident in "${MDM_DAEMONS[@]}"; do
 		rm -f "/Library/LaunchDaemons/${ident}.plist" 2>/dev/null || true
 	done
 	for ident in "${MDM_AGENTS[@]}"; do
 		rm -f "/Library/LaunchAgents/${ident}.plist" 2>/dev/null || true
 	done
-	success "Override plists removed (or were SIP-protected)"
+	success "Override plists removed"
 
-	# Remove MDM domain blocks from hosts
-	echo -e "${PUR}[5/5]${NC} ${CYAN}Removing MDM blocks from /etc/hosts${NC}"
+	# ── 5/8: Remove MDM domain blocks from /etc/hosts ──
+	echo -e "${PUR}[5/8]${NC} ${CYAN}Removing MDM blocks from /etc/hosts${NC}"
 	for domain in "${MDM_DOMAINS[@]}"; do
 		sed -i '' "/0\\.0\\.0\\.0 ${domain}/d" /etc/hosts 2>/dev/null || true
 	done
 	success "MDM domain blocks removed from hosts"
 
+	# ── 6/8: Re-enable MDM daemons/agents in launchctl + disabled.plist ──
+	echo -e "${PUR}[6/8]${NC} ${CYAN}Re-enabling MDM daemons and agents${NC}"
+
+	# Re-enable in launchctl runtime state
+	for ident in "${MDM_DAEMONS[@]}"; do
+		launchctl enable "system/$ident" 2>/dev/null || true
+	done
+	for ident in "${MDM_AGENTS[@]}"; do
+		launchctl enable "system/$ident" 2>/dev/null || true
+		launchctl enable "gui/$CONSOLE_UID/$ident" 2>/dev/null || true
+	done
+
+	# Remove entries from disabled.plist (restore from backup or patch)
+	disabled_plist="/private/var/db/com.apple.xpc.launchd/disabled.plist"
+	if [ -f "$BACKUP_DIR/disabled.plist.orig" ]; then
+		cp -p "$BACKUP_DIR/disabled.plist.orig" "$disabled_plist" 2>/dev/null || true
+		success "Restored original disabled.plist from backup"
+	elif [ -f "$disabled_plist" ] && command -v python3 &>/dev/null; then
+		all_idents=""
+		for ident in "${MDM_DAEMONS[@]}" "${MDM_AGENTS[@]}"; do
+			all_idents="$all_idents \"$ident\","
+		done
+		python3 -c "
+import plistlib
+path = '$disabled_plist'
+try:
+    with open(path, 'rb') as f:
+        data = plistlib.load(f)
+    for ident in [${all_idents}]:
+        data.pop(ident, None)
+    with open(path, 'wb') as f:
+        plistlib.dump(data, f)
+except Exception:
+    pass
+" 2>/dev/null && success "Removed MDM entries from disabled.plist" || warn "Could not update disabled.plist"
+	else
+		warn "Could not revert disabled.plist (no backup and no python3)"
+	fi
+
+	# ── 7/8: Remove bypass config markers ──
+	echo -e "${PUR}[7/8]${NC} ${CYAN}Removing bypass config markers${NC}"
+	config_dir="/var/db/ConfigurationProfiles/Settings"
+	if $SIP_ENABLED; then
+		warn "SIP enabled — cannot modify $config_dir on live OS"
+		info "Config markers from Recovery Mode bypass are unaffected"
+	else
+		rm -f "$config_dir/.cloudConfigProfileInstalled" 2>/dev/null || true
+		rm -f "$config_dir/.cloudConfigRecordNotFound" 2>/dev/null || true
+		success "Bypass config markers removed"
+	fi
+
+	# ── 8/8: Flush DNS cache + restart MDM services ──
+	echo -e "${PUR}[8/8]${NC} ${CYAN}Flushing DNS and restarting MDM services${NC}"
+
+	# Flush DNS so stale 0.0.0.0 entries don't linger
+	dscacheutil -flushcache 2>/dev/null || true
+	killall -HUP mDNSResponder 2>/dev/null || true
+	success "DNS cache flushed"
+
+	# Kick-start MDM daemons so they resume without a reboot
+	for ident in "${MDM_DAEMONS[@]}"; do
+		launchctl kickstart -k "system/$ident" 2>/dev/null || true
+	done
+	for ident in "${MDM_AGENTS[@]}"; do
+		launchctl kickstart -k "gui/$CONSOLE_UID/$ident" 2>/dev/null || true
+	done
+	info "MDM services restarted (or will start on next boot)"
+
+	# ── Cleanup logs and backups ──
 	echo ""
-	echo -e "${GRN}Uninstall complete.${NC} Hardening has been fully reversed."
+	echo -e "${CYAN}Cleanup:${NC}"
+	rm -f /var/log/mdmguardian.log 2>/dev/null && success "Removed /var/log/mdmguardian.log" || info "No guardian log to remove"
+	rm -f /var/log/mdm-hardener.log 2>/dev/null && success "Removed /var/log/mdm-hardener.log" || info "No hardener log to remove"
 	if [ -d "$BACKUP_DIR" ]; then
-		echo -e "Your original backups remain at: ${CYAN}$BACKUP_DIR${NC}"
+		info "Backups preserved at $BACKUP_DIR (delete manually if not needed)"
+		info "  To remove: sudo rm -rf $BACKUP_DIR"
+	fi
+
+	# ── Summary ──
+	echo ""
+	echo -e "${GRN}╔═══════════════════════════════════════════════════════╗${NC}"
+	echo -e "${GRN}║         Uninstall Complete                           ║${NC}"
+	echo -e "${GRN}╚═══════════════════════════════════════════════════════╝${NC}"
+	echo ""
+	echo -e "${CYAN}  What was reversed:${NC}"
+	echo -e "  ├─ Guardian + watcher daemons stopped and removed"
+	echo -e "  ├─ All immutable (schg) flags removed"
+	echo -e "  ├─ Override plists deleted"
+	echo -e "  ├─ MDM domain blocks removed from /etc/hosts"
+	echo -e "  ├─ MDM daemons/agents re-enabled in launchctl + disabled.plist"
+	if ! $SIP_ENABLED; then
+		echo -e "  ├─ Bypass config markers deleted"
+	else
+		echo -e "  ├─ Bypass config markers: skipped (SIP protected)"
+	fi
+	echo -e "  ├─ DNS cache flushed"
+	echo -e "  ├─ MDM services restarted"
+	echo -e "  └─ Log files cleaned up"
+	echo ""
+	if $SIP_ENABLED; then
+		warn "SIP is enabled — a reboot is recommended to fully restore MDM services"
+	else
+		info "All changes reversed. Reboot recommended but not required."
 	fi
 	echo ""
-	log "=== Uninstall complete ==="
 	exit 0
 fi
 
